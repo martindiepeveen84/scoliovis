@@ -1,4 +1,10 @@
-import React, { useEffect, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import Tippy from "@tippyjs/react";
 import toast from "react-hot-toast";
 
@@ -20,7 +26,7 @@ import {
 } from "react-icons/bs";
 import { AiOutlineFileJpg as JPGIcon } from "react-icons/ai";
 import { MdPrint as PrintIcon } from "react-icons/md";
-import { Document, Page, usePDF } from "@react-pdf/renderer";
+import { pdf } from "@react-pdf/renderer";
 import useForceUpdate from "@/hooks/useForceUpdate";
 import { useStore } from "store";
 import { debounce } from "lodash";
@@ -47,49 +53,99 @@ const ExportPopover: React.FC<IExportPopoverProps> = ({}) => {
   const [toastId, setToastId] = useState<string>("");
   const PDF_TOASTID = "PDF_TOAST";
 
-  const [pdfDownloadIsAvailable, setPDFDownloadIsAvailable] =
-    useState<boolean>(false);
-  // setCanvasURL can be used to regenerate the PDF.
+  // canvasURL kept for preview/other uses
   const [canvasURL, setCanvasURL] = useState<string>(
     "http://localhost:3000/example_images/1.jpg"
   );
   const scolioVisAPIResponse = useStore((state) => state.scoliovisAPIResponse);
   const drawSettings = useStore((state) => state.drawSettings);
-  const [instance, update] = usePDF({
-    document: (
-      <ScolioVisDocument
-        imageSrc={canvasURL}
-        scolioVisAPIResponse={scolioVisAPIResponse}
-      />
-    ),
-  });
 
-  useEffect(() => {
-    refetchCanvasURL();
+  // Keep track of the current object URL so we can revoke it and avoid leaks
+  const currentCanvasObjectURLRef = useRef<string | null>(null);
+
+  // Prevent multiple concurrent PDF generations
+  const isGeneratingRef = useRef<boolean>(false);
+
+  // refetchCanvasURL: returns freshly-produced URL (blob: or data:)
+  const refetchCanvasURL = useCallback(async (): Promise<string | null> => {
+    const canvas = document.getElementById("image-canvas") as HTMLCanvasElement | null;
+    if (!canvas) {
+      console.warn("refetchCanvasURL: canvas with id 'image-canvas' not found.");
+      return null;
+    }
+
+    // Revoke previous if exists
+    if (currentCanvasObjectURLRef.current) {
+      try {
+        URL.revokeObjectURL(currentCanvasObjectURLRef.current);
+      } catch {}
+      currentCanvasObjectURLRef.current = null;
+    }
+
+    return await new Promise<string | null>((resolve) => {
+      try {
+        canvas.toBlob(
+          (blob) => {
+            if (blob) {
+              const url = URL.createObjectURL(blob);
+              currentCanvasObjectURLRef.current = url;
+              setCanvasURL(url);
+              resolve(url);
+            } else {
+              try {
+                const data = canvas.toDataURL("image/png", 1);
+                setCanvasURL(data);
+                resolve(data);
+              } catch (err) {
+                console.error("refetchCanvasURL: failed to get image from canvas", err);
+                resolve(null);
+              }
+            }
+          },
+          "image/png",
+          1
+        );
+      } catch (err) {
+        // fallback
+        setTimeout(() => {
+          try {
+            const data = canvas.toDataURL("image/png", 1);
+            setCanvasURL(data);
+            resolve(data);
+          } catch (e) {
+            console.error("refetchCanvasURL fallback failed", e);
+            resolve(null);
+          }
+        }, 50);
+      }
+    });
   }, []);
 
-  useEffect(() => {
-    if (scolioVisAPIResponse) update();
-  }, [canvasURL]);
+  // Debounced refetch (kept for other UI flows)
+  const refetchCanvasURLDebounced = useMemo(() => {
+    const fn = debounce(() => {
+      refetchCanvasURL();
+    }, 120);
+    return fn;
+  }, [refetchCanvasURL]);
 
   useEffect(() => {
-    if (instance.loading === false && scolioVisAPIResponse) {
-      toast.success("Generated PDF Successfully!", {
-        id: PDF_TOASTID,
-      });
-      setPDFDownloadIsAvailable(true);
-    }
-  }, [instance.loading]);
+    // Do not auto-generate PDF on mount/upload
+    // cleanup on unmount
+    return () => {
+      if (currentCanvasObjectURLRef.current) {
+        try {
+          URL.revokeObjectURL(currentCanvasObjectURLRef.current);
+        } catch {}
+        currentCanvasObjectURLRef.current = null;
+      }
+      refetchCanvasURLDebounced.cancel();
+    };
+  }, [refetchCanvasURLDebounced]);
 
+  // When draw settings change, cancel any available pdf flag
   useEffect(() => {
-    if (pdfDownloadIsAvailable && instance.url) downloadPDF(instance.url);
-  }, [pdfDownloadIsAvailable]);
-
-  // Everytime draw settings changes, prevent PDF Download (Opt for regenerate)
-  useEffect(() => {
-    if (pdfDownloadIsAvailable) {
-      setPDFDownloadIsAvailable(false);
-    }
+    // no automatic downloads
   }, [drawSettings]);
 
   //#region Helpers
@@ -97,68 +153,58 @@ const ExportPopover: React.FC<IExportPopoverProps> = ({}) => {
     await new Promise((resolve) => setTimeout(resolve, ms || 600));
   }
 
-  function refetchCanvasURL() {
-    const canvas: HTMLCanvasElement = document.getElementById(
-      "image-canvas"
-    ) as HTMLCanvasElement;
-    setCanvasURL(canvas.toDataURL(`image/png`, 1));
+  function downloadURL(url: string, filename?: string) {
+    const link = document.createElement("a");
+    link.href = url;
+    if (filename) link.download = filename;
+    link.target = "_blank";
+    link.click();
   }
-
-  function handleDownloadImage(imageType: "png" | "jpeg") {
-    // Return a function so you don't need to () => {handleDownloadImage(imageType) for onClick}
-    return () => {
-      // 1. Generate Date
-      const date = new Date(Date.now());
-      const monthDay = date
-        .toLocaleString("en-us", {
-          month: "long",
-          day: "numeric",
-        })
-        .replaceAll(" ", "");
-      const time = date
-        .toLocaleTimeString("en-us", {
-          hour12: false,
-          hour: "numeric",
-          minute: "numeric",
-        })
-        .replaceAll(":", "");
-
-      // 2. Generate Link Element and Get Canvas Element
-      const imageLink = document.createElement("a");
-      const canvas: HTMLCanvasElement = document.getElementById(
-        "image-canvas"
-      ) as HTMLCanvasElement;
-      toast.promise(downloadingPromise(), {
-        success: (
-          <span>
-            Exported <b>.{imageType}</b>
-          </span>
-        ),
-        loading: "Exporting...",
-        error: "Failed to download",
-      });
-
-      // 3. Make Link Element Downloadable and Click
-      imageLink.download = `ScolioVisResult_${monthDay}_${time}.${imageType}`;
-      imageLink.href = canvas.toDataURL(`image/${imageType}`, 1);
-      imageLink.click();
-    };
-  }
-
-  function downloadPDF(blobURL: string) {
-    const pdfLink = document.createElement("a");
-    pdfLink.setAttribute("target", "_blank");
-    pdfLink.href = blobURL;
-    pdfLink.click();
-  }
-
   //#endregion
 
   const exportItems: ExportItem[] = [
-    // { exportTag: "PDF", onClick: handlePDF },
-    { exportTag: "JPG", onClick: handleDownloadImage("jpeg") },
-    { exportTag: "PNG", onClick: handleDownloadImage("png") },
-    // { exportTag: "Print", onClick: handlePrint },
+    {
+      exportTag: "JPG",
+      onClick: () => {
+        const canvas = document.getElementById("image-canvas") as HTMLCanvasElement | null;
+        if (!canvas) {
+          toast.error("Canvas not found.");
+          return;
+        }
+        const date = new Date();
+        const monthDay = date
+          .toLocaleString("en-us", { month: "long", day: "numeric" })
+          .replaceAll(" ", "");
+        const time = date
+          .toLocaleTimeString("en-us", { hour12: false, hour: "numeric", minute: "numeric" })
+          .replaceAll(":", "");
+        const imageLink = document.createElement("a");
+        imageLink.download = `ScolioVisResult_${monthDay}_${time}.jpeg`;
+        imageLink.href = canvas.toDataURL("image/jpeg", 1);
+        imageLink.click();
+      },
+    },
+    {
+      exportTag: "PNG",
+      onClick: () => {
+        const canvas = document.getElementById("image-canvas") as HTMLCanvasElement | null;
+        if (!canvas) {
+          toast.error("Canvas not found.");
+          return;
+        }
+        const date = new Date();
+        const monthDay = date
+          .toLocaleString("en-us", { month: "long", day: "numeric" })
+          .replaceAll(" ", "");
+        const time = date
+          .toLocaleTimeString("en-us", { hour12: false, hour: "numeric", minute: "numeric" })
+          .replaceAll(":", "");
+        const imageLink = document.createElement("a");
+        imageLink.download = `ScolioVisResult_${monthDay}_${time}.png`;
+        imageLink.href = canvas.toDataURL("image/png", 1);
+        imageLink.click();
+      },
+    },
   ];
 
   return (
@@ -184,28 +230,78 @@ const ExportPopover: React.FC<IExportPopoverProps> = ({}) => {
         offset={[0, 20]}
         content={
           <div className="relative z-20 shadow rounded-full bg-white text-primary h-12 flex items-center gap-x-5 px-5 border">
-            <ExportItemButton
-              exportTag="PDF"
-              onClick={() => {
-                if (pdfDownloadIsAvailable) {
-                  toast.success("Downloading PDF", { id: PDF_TOASTID });
-                  if (instance.url) downloadPDF(instance.url);
+            <button
+              className="flex items-center gap-x-3"
+              onClick={async () => {
+                // prevent concurrent runs
+                if (isGeneratingRef.current) return;
+                isGeneratingRef.current = true;
+
+                setToastId(toast.loading("Generating PDF...", { id: PDF_TOASTID }));
+
+                // cancel any pending debounce
+                refetchCanvasURLDebounced.cancel();
+
+                // produce fresh canvas image
+                const imgSrc = (await refetchCanvasURL()) || canvasURL;
+                if (!imgSrc) {
+                  toast.error("Failed to read canvas image.");
+                  toast.remove(toastId);
+                  isGeneratingRef.current = false;
                   return;
                 }
-                if (!pdfDownloadIsAvailable) {
-                  refetchCanvasURL();
-                  toast.loading("Generating PDF", { id: PDF_TOASTID });
+
+                try {
+                  // create document with fresh image
+                  const doc = (
+                    <ScolioVisDocument
+                      imageSrc={imgSrc}
+                      scolioVisAPIResponse={scolioVisAPIResponse}
+                    />
+                  );
+
+                  // generate blob (single call)
+                  const blob: Blob = await pdf(doc).toBlob();
+
+                  // create downloadable url and download once
+                  const blobUrl = URL.createObjectURL(blob);
+                  const date = new Date();
+                  const monthDay = date
+                    .toLocaleString("en-us", { month: "long", day: "numeric" })
+                    .replaceAll(" ", "");
+                  const time = date
+                    .toLocaleTimeString("en-us", { hour12: false, hour: "numeric", minute: "numeric" })
+                    .replaceAll(":", "");
+                  const filename = `ScolioVisResult_${monthDay}_${time}.pdf`;
+
+                  downloadURL(blobUrl, filename);
+
+                  // cleanup: revoke after short delay
+                  setTimeout(() => {
+                    try {
+                      URL.revokeObjectURL(blobUrl);
+                    } catch {}
+                  }, 1500);
+
+                  toast.success("Generated PDF Successfully!", { id: PDF_TOASTID });
+                } catch (err) {
+                  console.error("PDF generation failed", err);
+                  toast.error("Failed to generate PDF", { id: PDF_TOASTID });
+                } finally {
+                  isGeneratingRef.current = false;
                 }
               }}
-            />
-            {exportItems &&
-              exportItems.map((eI, i) => (
-                <ExportItemButton
-                  key={i}
-                  exportTag={eI.exportTag}
-                  onClick={eI.onClick}
-                />
-              ))}
+            >
+              <PDFIcon />
+              <span className="ml-2">PDF</span>
+            </button>
+
+            {exportItems.map((eI, i) => (
+              <button key={i} onClick={eI.onClick} className="flex items-center gap-x-2">
+                {EXPORT_ICONS[eI.exportTag]}
+                <span className="ml-1">{eI.exportTag}</span>
+              </button>
+            ))}
           </div>
         }
       >
@@ -220,37 +316,3 @@ const ExportPopover: React.FC<IExportPopoverProps> = ({}) => {
 };
 
 export default ExportPopover;
-
-// Components
-
-interface IExportItemButtonProps {
-  exportTag: ExportTag;
-  onClick?: () => any;
-  disabled?: boolean;
-}
-export const ExportItemButton: React.FC<IExportItemButtonProps> = ({
-  exportTag,
-  onClick = () => {},
-  disabled = false,
-}) => {
-  return (
-    <Tippy
-      theme="transparent"
-      placement="top"
-      animation="shift-away-subtle"
-      content={<span className="text-xs">as {exportTag}</span>}
-    >
-      <motion.button
-        initial="rest"
-        whileHover="hover"
-        className="hover:bg-blue-100 rounded-full h-9 w-9 grid place-items-center group disabled:opacity-50"
-        onClick={onClick}
-        disabled={disabled}
-      >
-        <motion.span variants={exportItemVariants}>
-          {EXPORT_ICONS[exportTag]}
-        </motion.span>
-      </motion.button>
-    </Tippy>
-  );
-};
